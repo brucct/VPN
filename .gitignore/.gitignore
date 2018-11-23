@@ -1,0 +1,85 @@
+前置条件：接入、出口服务器内网互通
+
+一、出口服务器部署IKEV2 VPN 
+1、安装依赖包：
+   yum -y install strongswan strongswan-plugin-openssl strongswan-plugin-eap-mschapv2
+2、编辑配置文件：
+   vim /etc/strongswan/strongswan.conf
+    charon {
+        load_modular = yes
+        dns1 = 8.8.8.8
+        dns2 = 1.1.1.1
+        plugins {
+                include strongswan.d/charon/*.conf
+        }
+}
+
+include strongswan.d/*.conf
+3、编辑配置文件：
+  vim /etc/strongswan/ipsec.conf
+  config setup
+   charondebug="cfg 2, dmn 2, ike 2, net 0"
+   uniqueids=no
+
+ conn ikev2-vpn
+    ikelifetime=48h
+    keylife=24h
+    rekey=no
+    rekeymargin=3m
+    keyingtries=1
+    ike = aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+    esp = aes256-sha256,aes256-sha1,3des-sha1!
+    compress=yes
+    dpdaction=hold
+    dpddelay=10s
+    rightauth=eap-mschapv2
+    rightsendcert=never
+    eap_identity=%any
+    auto=start
+    leftsendcert=always
+    keyexchange=ikev2
+    leftid=119.28.151.225
+    leftcert=server.cert.pem
+    rightsourceip=10.32.12.0/22
+    leftsubnet=0.0.0.0/0
+    leftdns=8.8.8.8,1.1.1.1
+    rightdns=8.8.8.8,1.1.1.1
+    auto=start
+4、编辑密钥文件：
+ vim /etc/strongswan/ipsec.secrets
+ : RSA server.pem
+ : PSK "testikev2"
+ test : EAP "123456"
+5、创建自签证书：
+#生成CA证书的私钥
+strongswan pki --gen --outform pem > ca.pem
+#使用私钥，签名CA证书
+strongswan pki --self --in ca.pem --dn "C=cn, O=vpngo, CN=vpngo" --ca --lifetime 3650 --outform pem >ca.cert.pem
+#生成服务器证书的私钥
+strongswan pki --gen --outform pem > server.pem
+#生成客户端证书的私钥	
+strongswan pki --gen --outform pem > client.pem
+#使用私钥 同时用CA证书的私钥和CA证书 签名服务器证书
+strongswan pki --pub --in server.pem | strongswan pki --issue --lifetime 3650 --cacert ca.cert.pem --cakey ca.pem --dn "C=cn, O=vpngo, CN=119.28.151.225" --san="119.28.151.225" --flag serverAuth --flag ikeIntermediate --outform pem > server.cert.pem
+#使用私钥，签名客户端证书
+strongswan pki --pub --in client.pem | strongswan pki --issue --cacert ca.cert.pem --cakey ca.pem --dn "C=cn, O=vpngo, CN=vpngo client" --outform pem > client.cert.pem
+生成pkcs12证书:
+openssl pkcs12 -export -inkey client.pem -in client.cert.pem -name "client" -certfile ca.cert.pem -caname "vpngo"  -out client.cert.p12
+6、设置防火墙规则：
+ iptables -A FORWARD -s 10.32.12.0/22  -j ACCEPT
+ iptables -t nat -A POSTROUTING -s 10.32.12.0/22  -j MASQUERADE
+ iptables -t nat -A POSTROUTING -s 10.32.12.0/22 -j SNAT --to public_ip
+   
+7、开启转发：vim /etc/sysctl.conf  net.ipv4.ip_forward=1
+8、复制CA
+   cp -f ca.cert.pem     /etc/strongswan/ipsec.d/cacerts/
+   cp -f server.cert.pem /etc/strongswan/ipsec.d/certs/
+   cp -f server.pem      /etc/strongswan/ipsec.d/private/
+   cp -f client.cert.pem /etc/strongswan/ipsec.d/certs/
+   cp -f client.pem      /etc/strongswan/ipsec.d/private/
+
+二、接入服务器配置iptables中转
+iptables -t nat -A PREROUTING -p udp --dport 500 -j DNAT --to-destination vpn_private_ip:500
+iptables -t nat -A PREROUTING -p udp --dport 4500 -j DNAT --to-destination vpn_private_ip:4500
+iptables -t nat -A POSTROUTING -p udp -d vpn_private_ip --dport 500 -j SNAT --to-source  private_ip
+iptables -t nat -A POSTROUTING -p udp -d vpn_private_ip --dport 4500 -j SNAT --to-source  private_ip
