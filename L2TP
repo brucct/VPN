@@ -1,0 +1,187 @@
+前置条件：接入、出口服务器内网互通
+
+一、出口服务器部署L2TP VPN
+1、先看看你的主机是否支持pptp，返回结果为yes就表示通过
+modprobe ppp-compress-18 && echo yes
+
+2、是否开启了TUN 有的虚拟机主机需要开启，返回结果为cat: /dev/net/tun: File descriptor in bad state。就表示通过。
+cat /dev/net/tun
+
+3、更新一下再安装
+yum install update -y
+yum update -y
+
+4、安装EPEL源
+yum install -y epel-release
+
+5、安装xl2tpd和libreswan
+yum install -y xl2tpd libreswan lsof
+
+6、编辑xl2tpd配置文件
+vim /etc/xl2tpd/xl2tpd.conf
+
+[global]
+port = 1701
+auth file = /etc/ppp/chap-secrets
+debug avp = yes
+debug network = yes
+debug state = yes
+debug tunnel = yes
+
+[lns default]
+ip range = 10.32.8.10-10.32.8.254  #分配给客户端的地址池
+local ip = 10.32.8.1
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = l2tpd
+pppoptfile = /etc/ppp/options.xl2tpd
+ppp debug = yes
+length bit = yes
+
+7、编辑pppoptfile文件
+vim /etc/ppp/options.xl2tpd
+
+ipcp-accept-remote
+ipcp-accept-local
+ms-dns 8.8.8.8
+ms-dns 1.1.1.1
+# refuse-eap
+# # require-mschap-v2
+name xl2tpd
+noccp
+# noauth
+# name myuser@myhost.com
+# password myuserpassword
+auth
+#mtu 1280
+#mru 1280
+# defaultroute
+# debug
+# usepeerdns
+proxyarp
+lcp-echo-failure 4
+lcp-echo-interval 30
+connect-delay 5000
+logfile /var/log/xl2tpd.log
+
+8、编辑ipsec配置文件
+vim /etc/ipsec.conf
+
+config setup
+ 
+        protostack=netkey
+ 
+        dumpdir=/var/run/pluto/
+ 
+        virtual_private=%v4:10.0.0.0/8,%v4:172.100.0.0/12,%v4:25.0.0.0/8,%v4:100.64.0.0/10,%v6:fd00::/8,%v6:fe80::/10
+ 
+        include /etc/ipsec.d/*.conf
+
+9、编辑include的conn文件
+vim /etc/ipsec.d/l2tp-ipsec.conf
+conn L2TP-PSK-NAT
+    rightsubnet=0.0.0.0/0
+    dpddelay=10
+    dpdtimeout=20
+    dpdaction=clear
+    forceencaps=yes
+    also=L2TP-PSK-noNAT
+
+conn L2TP-PSK-noNAT
+    authby=secret
+    pfs=no
+    auto=add
+    keyingtries=3
+    rekey=no
+    ikelifetime=8h
+    keylife=1h
+    type=transport
+    left=119.28.151.225
+    leftprotoport=17/1701
+    right=%any
+    rightprotoport=17/%any
+
+10、设置用户名密码
+vim /etc/ppp/chap-secrets
+ l2tp * "123456" *
+
+11、设置PSK
+vim /etc/ipsec.secrets
+
+include /etc/ipsec.d/*.secrets
+119.28.151.225 %any: PSK "testvpn"
+
+12、设置防火墙规则
+iptables -t nat -A POSTROUTING -s 10.32.8.0/24  -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.32.8.0/24 -j SNAT --to public_ip
+
+13、设置内核参数
+vim  /etc/sysctl.conf
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.ip_forward=1
+# max open files
+fs.file-max = 51200
+# max read buffer
+net.core.rmem_max = 67108864
+# max write buffer
+net.core.wmem_max = 67108864
+# default read buffer
+net.core.rmem_default = 1048576
+# default write buffer
+net.core.wmem_default = 1048576
+# max processor input queue
+net.core.netdev_max_backlog = 4096
+# max backlog
+net.core.somaxconn = 4096
+# resist SYN flood attacks
+net.ipv4.tcp_syncookies = 1
+# reuse timewait sockets when safe
+net.ipv4.tcp_tw_reuse = 1
+# turn off fast timewait sockets recycling
+#net.ipv4.tcp_tw_recycle = 0
+# short FIN timeout
+net.ipv4.tcp_fin_timeout = 30
+# short keepalive time
+net.ipv4.tcp_keepalive_time = 1200
+# outbound port range
+net.ipv4.ip_local_port_range = 10000 65000
+# max SYN backlog
+net.ipv4.tcp_max_syn_backlog = 4096
+# max timewait sockets held by system simultaneously
+net.ipv4.tcp_max_tw_buckets = 5000
+# turn on TCP Fast Open on both client and server side
+net.ipv4.tcp_fastopen = 3
+# TCP receive buffer
+net.ipv4.tcp_rmem = 4096 87380 67108864
+# TCP write buffer
+net.ipv4.tcp_wmem = 4096 65536 67108864
+# turn on path MTU discovery
+net.ipv4.tcp_mtu_probing = 1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+sysctl -p
+
+14、ipsec启动&检查
+systemctl enable ipsec
+systemctl restart ipsec
+检查：
+ipsec verify
+
+15、xl2tpd启动
+systemctl enable xl2tpd
+systemctl restart xl2tpd
+
+Windows连接需要修改注册表键值
+HKEY_LOCAL_MACHINE\ System\CurrentControlSet\Services\Rasman\Parameters   新建DWORD值  ProhibitIpSec=1 重启计算机
+
+
+二、接入服务器配置iptables中转
+iptables -t nat -A PREROUTING -p udp --dport 500 -j DNAT --to-destination vpn_private_ip:500
+iptables -t nat -A PREROUTING -p udp --dport 4500 -j DNAT --to-destination vpn_private_ip:4500
+iptables -t nat -A PREROUTING -p udp --dport 1701 -j DNAT --to-destination vpn_private_ip:1701
+iptables -t nat -A POSTROUTING -p udp -d vpn_private_ip --dport 500 -j SNAT --to-source  private_ip
+iptables -t nat -A POSTROUTING -p udp -d vpn_private_ip --dport 4500 -j SNAT --to-source  private_ip
+iptables -t nat -A POSTROUTING -p udp -d vpn_private_ip --dport 1701 -j SNAT --to-source  private_ip
